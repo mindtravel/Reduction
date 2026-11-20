@@ -81,6 +81,14 @@ fun main(args: Array<String>) {
     }
     server.executor = Executors.newCachedThreadPool { Thread(it).apply { isDaemon = true } }
     server.createContext("/") { exchange ->
+        val headers = exchange.requestHeaders
+        if (!LocalOrigin.allows(port, headers.getFirst("Host"), headers.getFirst("Origin"))) {
+            // Addressed to some other name: a page that had its name pointed here, not this computer's own.
+            System.err.println("Refused ${exchange.requestMethod} ${exchange.requestURI.path}: Host ${headers.getFirst("Host")}, Origin ${headers.getFirst("Origin")}")
+            exchange.sendResponseHeaders(403, -1)
+            exchange.close()
+            return@createContext
+        }
         runCatching { desktop.handle(exchange) }.onFailure {
             // Said in the log: a request that fails without a word leaves nothing to go on.
             System.err.println("${exchange.requestMethod} ${exchange.requestURI} failed: $it")
