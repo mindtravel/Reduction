@@ -28,7 +28,7 @@ class DeepSeekChatGateway(
             }
         }
 
-        http.stream("/chat/completions", request.apiKey, body) { line ->
+        http.stream("/chat/completions", request.apiKey, body, request.cancellation) { line ->
             parser.parse(line).forEach(onEvent)
         }
     }

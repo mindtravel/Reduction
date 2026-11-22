@@ -1,12 +1,17 @@
 package com.mindtravel.reduction.model.chat
 
 import com.mindtravel.reduction.core.ApiException
+import com.mindtravel.reduction.core.CancelSignal
+import com.mindtravel.reduction.core.NetworkException
 import com.mindtravel.reduction.feature.chat.model.ChatCallbacks
 import com.mindtravel.reduction.feature.chat.model.ChatSession
 import com.mindtravel.reduction.feature.chat.model.ToolCallAccumulator
 import com.mindtravel.reduction.feature.chat.model.tools.CalculatorTool
+import com.mindtravel.reduction.feature.chat.model.tools.ChatTool
 import com.mindtravel.reduction.feature.chat.model.tools.ToolRegistry
 import com.mindtravel.reduction.model.chat.ChatStreamParser
+import com.mindtravel.reduction.model.chat.ToolSpec
+import java.util.concurrent.CancellationException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -281,5 +286,111 @@ class ChatSessionTest {
         }
         assertEquals(1, gateway.asked)
         assertEquals(listOf("半句"), callbacks.tokens)
+    }
+
+    /** Emits a tool call, then cancels the reply before the tool can run. */
+    private class CancellingAfterToolCall : ChatGateway {
+        override fun stream(request: ChatRequest, onEvent: (ChatStreamEvent) -> Unit) {
+            onEvent(ChatStreamEvent.ToolCallDelta(0, "call_1", "touch", "{}"))
+            onEvent(ChatStreamEvent.Finished("tool_calls"))
+            request.cancellation.cancel()
+        }
+    }
+
+    /** Cancels the reply and then reports a network error, as a cancelled call does. */
+    private class CancellingFailure : ChatGateway {
+        var asked = 0
+
+        override fun stream(request: ChatRequest, onEvent: (ChatStreamEvent) -> Unit) {
+            asked++
+            request.cancellation.cancel()
+            throw NetworkException("网络错误：断了")
+        }
+    }
+
+    private class CountingTool : ChatTool {
+        var executions = 0
+        override val spec = ToolSpec("touch", "test tool", emptyList())
+
+        override fun execute(argumentsJson: String): String {
+            executions++
+            return "done"
+        }
+    }
+
+    @Test
+    fun `a cancelled reply does not call the model`() {
+        val api = FakeChatGateway(listOf(listOf(ChatStreamEvent.Content("不应该出现"))))
+        val callbacks = RecordingCallbacks()
+        val signal = CancelSignal().apply { cancel() }
+
+        try {
+            ChatSession(api).run(
+                ChatRequest(
+                    apiKey = "test",
+                    model = "deepseek-flash",
+                    messages = listOf(ChatMessage(Role.USER, "你好")),
+                    tools = emptyList(),
+                    cancellation = signal
+                ),
+                ToolRegistry(emptyList()),
+                callbacks
+            )
+            fail("expected CancellationException")
+        } catch (_: CancellationException) {
+        }
+
+        assertEquals(0, api.requests.size)
+        assertEquals(null, callbacks.completed)
+        assertEquals(null, callbacks.failed)
+    }
+
+    @Test
+    fun `a cancelled reply stops before the tool it just asked for`() {
+        val tool = CountingTool()
+        val callbacks = RecordingCallbacks()
+
+        try {
+            ChatSession(CancellingAfterToolCall()).run(
+                ChatRequest(
+                    apiKey = "test",
+                    model = "deepseek-flash",
+                    messages = listOf(ChatMessage(Role.USER, "请动手")),
+                    tools = emptyList()
+                ),
+                ToolRegistry(listOf(tool)),
+                callbacks
+            )
+            fail("expected CancellationException")
+        } catch (_: CancellationException) {
+        }
+
+        assertEquals("the tool must not run after the reply was cancelled", 0, tool.executions)
+        assertEquals(null, callbacks.completed)
+        assertEquals(null, callbacks.failed)
+    }
+
+    @Test
+    fun `a cancelled reply does not retry the request`() {
+        val gateway = CancellingFailure()
+        val callbacks = RecordingCallbacks()
+
+        try {
+            ChatSession(gateway, pause = {}).run(
+                ChatRequest(
+                    apiKey = "test",
+                    model = "deepseek-flash",
+                    messages = listOf(ChatMessage(Role.USER, "你好")),
+                    tools = emptyList()
+                ),
+                ToolRegistry(emptyList()),
+                callbacks
+            )
+            fail("expected CancellationException")
+        } catch (_: CancellationException) {
+        }
+
+        assertEquals(1, gateway.asked)
+        assertEquals(null, callbacks.failed)
     }
 }

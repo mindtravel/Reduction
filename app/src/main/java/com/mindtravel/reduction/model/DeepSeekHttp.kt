@@ -1,6 +1,7 @@
 package com.mindtravel.reduction.model
 
 import com.mindtravel.reduction.core.ApiException
+import com.mindtravel.reduction.core.CancelSignal
 import com.mindtravel.reduction.core.Logs
 import com.mindtravel.reduction.core.NetworkException
 import com.mindtravel.reduction.core.objectOrNull
@@ -11,6 +12,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 
 class DeepSeekHttp(
@@ -90,26 +92,35 @@ class DeepSeekHttp(
         path: String,
         apiKey: String,
         body: JSONObject,
+        cancellation: CancelSignal? = null,
         onLine: (String) -> Unit
     ) {
         val request = request(path, apiKey)
             .header("Content-Type", JSON_CONTENT_TYPE)
             .post(body.toString().toRequestBody(JSON_CONTENT_TYPE.toMediaType()))
             .build()
+        val call = client.newCall(request)
+        // The coroutine job cannot interrupt a blocking read; this is what does.
+        cancellation?.onCancel { call.cancel() }
         try {
-            client.newCall(request).execute().use { response ->
+            cancellation?.ensureActive()
+            call.execute().use { response ->
                 if (!response.isSuccessful) {
                     throw httpError(response.code, response.body?.string().orEmpty())
                 }
                 val source = response.body?.source() ?: throw ApiException("DeepSeek 返回了空响应")
                 while (true) {
+                    cancellation?.ensureActive()
                     val line = source.readUtf8Line() ?: break
                     onLine(line)
                 }
             }
+        } catch (t: CancellationException) {
+            throw t
         } catch (t: ApiException) {
             throw t
         } catch (t: Throwable) {
+            if (cancellation?.isCancelled == true) throw CancellationException("回复已取消")
             Logs.add("Network error: ${t.javaClass.simpleName}: ${t.message}")
             throw NetworkException("网络错误：${t.message ?: t.javaClass.simpleName}", t)
         }

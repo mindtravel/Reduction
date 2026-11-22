@@ -1,6 +1,7 @@
 package com.mindtravel.reduction.feature.chat.model
 
 import com.mindtravel.reduction.core.ApiException
+import com.mindtravel.reduction.core.CancelSignal
 import com.mindtravel.reduction.core.Logs
 import com.mindtravel.reduction.core.NetworkException
 import com.mindtravel.reduction.core.TextSanitizer
@@ -11,6 +12,7 @@ import com.mindtravel.reduction.model.chat.ChatMessage
 import com.mindtravel.reduction.model.chat.ChatRequest
 import com.mindtravel.reduction.model.chat.ChatStreamEvent
 import com.mindtravel.reduction.model.chat.Role
+import java.util.concurrent.CancellationException
 
 class ChatSession(
     private val gateway: ChatGateway,
@@ -37,8 +39,10 @@ class ChatSession(
         callbacks: ChatCallbacks
     ) {
         val messages = request.messages.toMutableList()
+        val cancellation = request.cancellation
 
         repeat(maxToolRounds) {
+            cancellation.ensureActive()
             val content = StringBuilder()
             var toolCalls = ToolCallAccumulator()
             var failure: String? = null
@@ -50,6 +54,7 @@ class ChatSession(
             // has been shown or said yet. After the last attempt the failure is the caller's to report.
             var attempt = 1
             while (true) {
+                cancellation.ensureActive()
                 try {
                     gateway.stream(request.copy(messages = messages.toList(), tools = tools.specs())) { event ->
                         when (event) {
@@ -73,6 +78,7 @@ class ChatSession(
                     }
                     break
                 } catch (t: NetworkException) {
+                    if (cancellation.isCancelled) throw CancellationException("回复已取消")
                     if (sawContent || attempt >= ATTEMPTS) throw t
                     attempt++
                     Logs.add("Chat request did not get through, attempt $attempt of $ATTEMPTS")
@@ -80,9 +86,11 @@ class ChatSession(
                     toolCalls = ToolCallAccumulator()
                     failure = null
                     finishReason = null
-                    pause(RETRY_PAUSE_MS)
+                    rest(cancellation)
                 }
             }
+
+            cancellation.ensureActive()
 
             if (droppedNulls > 0) {
                 Logs.add("chat dropped null tokens=$droppedNulls")
@@ -124,12 +132,14 @@ class ChatSession(
 
             val shown = ArrayList<ChatImage>()
             for (call in calls) {
+                cancellation.ensureActive()
                 callbacks.onToolStarted(
                     call.name,
                     tools.summary(call.name, call.arguments),
                     call.arguments,
                     tools.announces(call.name, call.arguments)
                 )
+                cancellation.ensureActive()
                 val startedAt = System.nanoTime()
                 val result = tools.execute(call.name, call.arguments)
                 val durationMs = (System.nanoTime() - startedAt) / 1_000_000
@@ -153,6 +163,19 @@ class ChatSession(
             }
         }
 
+        cancellation.ensureActive()
         callbacks.onFailed("工具调用次数过多，请换个问法")
+    }
+
+    /** Waits between attempts in small steps, so a cancellation does not wait out the whole pause. */
+    private fun rest(cancellation: CancelSignal) {
+        var left = RETRY_PAUSE_MS
+        while (left > 0) {
+            cancellation.ensureActive()
+            val step = minOf(left, 100L)
+            pause(step)
+            left -= step
+        }
+        cancellation.ensureActive()
     }
 }

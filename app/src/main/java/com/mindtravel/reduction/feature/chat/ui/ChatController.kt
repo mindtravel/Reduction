@@ -4,6 +4,7 @@ import com.mindtravel.reduction.core.settings.AppSettings
 import com.mindtravel.reduction.core.VoiceTrace
 
 import com.mindtravel.reduction.core.ApiException
+import com.mindtravel.reduction.core.CancelSignal
 import com.mindtravel.reduction.core.Logs
 import com.mindtravel.reduction.core.events.EventSink
 import com.mindtravel.reduction.core.settings.SettingsGateway
@@ -17,6 +18,7 @@ import com.mindtravel.reduction.feature.voice.SpeechController
 import com.mindtravel.reduction.model.chat.ChatMessage
 import com.mindtravel.reduction.model.chat.ChatRequest
 import com.mindtravel.reduction.model.chat.Role
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -46,6 +48,7 @@ class ChatController(
     var observer: ReplyObserver? = null
 
     private class Reply(val id: String) {
+        val cancellation = CancelSignal()
         var generated = false
         var spoken = false
         var closed = false
@@ -75,15 +78,16 @@ class ChatController(
         }
 
         val registry = toolFactory.create(settings)
+        val reply = Reply(requestId)
         val request = ChatRequest(
             apiKey = settings.apiKey,
             model = model,
             messages = boundedMessages,
-            tools = registry.specs()
+            tools = registry.specs(),
+            cancellation = reply.cancellation
         )
 
         cancel()
-        val reply = Reply(requestId)
         synchronized(lock) { current = reply }
         speech.open(requestId) {
             synchronized(lock) { reply.spoken = true }
@@ -97,6 +101,9 @@ class ChatController(
         reply.job = scope.launch(Dispatchers.IO) {
             try {
                 chatEngine.run(request, registry, callbacksFor(reply, onCompleted))
+            } catch (t: CancellationException) {
+                // A new message, a wake word or a stop: the old reply is no longer wanted.
+                Logs.add("chat cancelled")
             } catch (t: NetworkException) {
                 Logs.add("chat failed after ${ChatSession.ATTEMPTS} attempts: ${t.message}")
                 fail(reply, "试了 ${ChatSession.ATTEMPTS} 次都没连上：${t.message ?: "网络不通"}", Cue.NO_NETWORK)
@@ -121,6 +128,7 @@ class ChatController(
             active.closed = true
             active
         }
+        reply.cancellation.cancel()
         reply.job?.cancel()
         speech.stop(notify = false)
         Logs.add("chat aborted by ${Throwable().stackTrace.getOrNull(1)?.let { it.className.substringAfterLast('.') + "." + it.methodName }}")

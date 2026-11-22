@@ -1,6 +1,7 @@
 package com.mindtravel.reduction.model.chat
 
 import com.mindtravel.reduction.core.ApiException
+import com.mindtravel.reduction.core.CancelSignal
 import com.mindtravel.reduction.core.objects
 import com.mindtravel.reduction.core.TextSanitizer
 import com.mindtravel.reduction.core.stringOrNull
@@ -199,7 +200,9 @@ data class ChatRequest(
     val model: String,
     val messages: List<ChatMessage>,
     val tools: List<ToolSpec>,
-    val temperature: Double = 0.7
+    val temperature: Double = 0.7,
+    /** Carries "the user no longer wants this reply" to the transport; not part of the wire format. */
+    val cancellation: CancelSignal = CancelSignal()
 )
 
 sealed interface ChatStreamEvent {
